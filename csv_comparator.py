@@ -614,20 +614,21 @@ class CSVComparator(QMainWindow):
         dup1 = int(df1.duplicated(subset=keys).sum())
         dup2 = int(df2.duplicated(subset=keys).sum())
 
-        # Positional occurrence index within each key group so duplicate rows
-        # are matched 1st-to-1st, 2nd-to-2nd, etc. rather than being dropped.
-        df1["_occ"] = df1.groupby(keys).cumcount()
-        df2["_occ"] = df2.groupby(keys).cumcount()
-        merge_keys = keys + ["_occ"]
+        # Slice to only the columns we need, then add a within-group occurrence
+        # counter so duplicate key rows are matched positionally (1st↔1st, 2nd↔2nd).
+        _OCC = "__occ__"
+        d1 = df1[keys + compare_cols].reset_index(drop=True)
+        d2 = df2[keys + compare_cols].reset_index(drop=True)
+        d1[_OCC] = d1.groupby(keys, sort=False).cumcount()
+        d2[_OCC] = d2.groupby(keys, sort=False).cumcount()
 
         merged = pd.merge(
-            df1[merge_keys + compare_cols],
-            df2[merge_keys + compare_cols],
-            on=merge_keys,
+            d1, d2,
+            on=keys + [_OCC],
             how="outer",
             suffixes=(" (File1)", " (File2)"),
             indicator=True,
-        ).drop(columns=["_occ"])
+        ).drop(columns=[_OCC])
         non_cat = [c for c in merged.columns if str(merged[c].dtype) != "category"]
         merged[non_cat] = merged[non_cat].fillna("")
 
