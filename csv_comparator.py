@@ -606,19 +606,28 @@ class CSVComparator(QMainWindow):
         if rename_f2:
             df2 = df2.rename(columns=rename_f2)
 
-        # Non-key columns common to both files (by name, after key renaming)
-        f2_cols = set(df2.columns)
-        all_common = [c for c in df1.columns if c in f2_cols]
-        compare_cols = [c for c in self._columns_to_compare(all_common) if c not in set(keys)]
+        key_set = set(keys)
+        ignore_set = set(self.ignore_columns)
+
+        # All non-key, non-ignored data columns from each file
+        f1_data = [c for c in df1.columns if c not in key_set and c not in ignore_set]
+        f2_data = [c for c in df2.columns if c not in key_set and c not in ignore_set]
+        f2_data_set = set(f2_data)
+
+        # Columns present in both files — these can be diff-checked
+        compare_cols = [c for c in f1_data if c in f2_data_set]
+        # Columns present in only one file — shown but not diff-checked
+        only_f1 = [c for c in f1_data if c not in f2_data_set]
+        only_f2 = [c for c in f2_data if c not in set(f1_data)]
 
         dup1 = int(df1.duplicated(subset=keys).sum())
         dup2 = int(df2.duplicated(subset=keys).sum())
 
-        # Slice to only the columns we need, then add a within-group occurrence
-        # counter so duplicate key rows are matched positionally (1st↔1st, 2nd↔2nd).
+        # Slice to display columns only, then add a within-group occurrence counter
+        # so duplicate key rows are matched positionally (1st↔1st, 2nd↔2nd).
         _OCC = "__occ__"
-        d1 = df1[keys + compare_cols].reset_index(drop=True)
-        d2 = df2[keys + compare_cols].reset_index(drop=True)
+        d1 = df1[keys + f1_data].reset_index(drop=True)
+        d2 = df2[keys + f2_data].reset_index(drop=True)
         d1[_OCC] = d1.groupby(keys, sort=False).cumcount()
         d2[_OCC] = d2.groupby(keys, sort=False).cumcount()
 
@@ -629,18 +638,24 @@ class CSVComparator(QMainWindow):
             suffixes=(" (File1)", " (File2)"),
             indicator=True,
         ).drop(columns=[_OCC])
-        non_cat = [c for c in merged.columns if str(merged[c].dtype) != "category"]
-        merged[non_cat] = merged[non_cat].fillna("")
+
+        # Fill NaN column-by-column to avoid Categorical restriction on _merge
+        for col in merged.columns:
+            if str(merged[col].dtype) != "category":
+                merged[col] = merged[col].fillna("")
 
         both = merged["_merge"] == "both"
 
+        # Diff-check only common columns
+        has_diff = pd.Series(False, index=merged.index)
         diff_mask = pd.DataFrame(False, index=merged.index, columns=compare_cols)
         for c in compare_cols:
             diff_mask[c] = (
                 merged[f"{c} (File1)"].astype(str) != merged[f"{c} (File2)"].astype(str)
             ) & both
+        if compare_cols:
+            has_diff = diff_mask.any(axis=1)
 
-        has_diff = diff_mask.any(axis=1)
         status = np.where(merged["_merge"] == "left_only",  "ONLY IN FILE 1",
                  np.where(merged["_merge"] == "right_only", "ONLY IN FILE 2",
                  np.where(has_diff,                         "DIFFERENT", "MATCH")))
@@ -654,18 +669,26 @@ class CSVComparator(QMainWindow):
                 .values
             )
 
+        # Build output: keys, then all column pairs side-by-side
         comp_df = merged[keys].copy()
-        for c in compare_cols:
+        for c in compare_cols:               # common columns — both sides have data
             comp_df[f"{c} (File1)"] = merged[f"{c} (File1)"].values
             comp_df[f"{c} (File2)"] = merged[f"{c} (File2)"].values
+        for c in only_f1:                    # File-1-only columns — File2 side empty
+            comp_df[f"{c} (File1)"] = merged[c].values
+            comp_df[f"{c} (File2)"] = ""
+        for c in only_f2:                    # File-2-only columns — File1 side empty
+            comp_df[f"{c} (File1)"] = ""
+            comp_df[f"{c} (File2)"] = merged[c].values
         comp_df["Status"] = status
         comp_df["Differing Columns"] = differing_cols
 
+        all_display_cols = compare_cols + only_f1 + only_f2
         keys_display = [f"{k}→{v}" if k != v else k for k, v in self.key_mapping.items()]
         summary = self._build_summary(
             int((status == "MATCH").sum()), int((status == "DIFFERENT").sum()),
             int((status == "ONLY IN FILE 1").sum()), int((status == "ONLY IN FILE 2").sum()),
-            len(self.df1), len(self.df2), compare_cols, keys_display,
+            len(self.df1), len(self.df2), all_display_cols, keys_display,
             dup1=dup1, dup2=dup2,
         )
         return comp_df, summary
