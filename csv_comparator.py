@@ -526,6 +526,24 @@ class CSVComparator(QMainWindow):
         if self.sort_column and self.sort_column in comp_df.columns:
             comp_df = comp_df.sort_values(by=self.sort_column, kind="mergesort").reset_index(drop=True)
 
+        # Drop rows where every data cell on both sides is blank (e.g. trailing
+        # empty rows when one file is longer than the other).
+        data_cols = [c for c in comp_df.columns if c.endswith(" (File1)") or c.endswith(" (File2)")]
+        if data_cols:
+            blank_mask = (comp_df[data_cols] == "").all(axis=1)
+            if blank_mask.any():
+                comp_df = comp_df[~blank_mask].reset_index(drop=True)
+                sv = comp_df["Status"].values
+                for metric, val in [
+                    ("Matching Rows",  int((sv == "MATCH").sum())),
+                    ("Different Rows", int((sv == "DIFFERENT").sum())),
+                    ("Only in File 1", int((sv == "ONLY IN FILE 1").sum())),
+                    ("Only in File 2", int((sv == "ONLY IN FILE 2").sum())),
+                ]:
+                    m = summary["Metric"] == metric
+                    if m.any():
+                        summary.loc[m, "Value"] = f"{val:,}"
+
         self.comparison_df = comp_df
         self.summary_df = summary
         self._render_comparison(comp_df)
@@ -772,11 +790,7 @@ class CSVComparator(QMainWindow):
         if not path:
             return
         try:
-            with pd.ExcelWriter(path, engine="openpyxl") as writer:
-                if self.summary_df is not None:
-                    self.summary_df.to_excel(writer, sheet_name="Summary", index=False)
-                self.comparison_df.to_excel(writer, sheet_name="Comparison", index=False)
-                self._apply_excel_colors(writer, "Comparison", self.comparison_df)
+            self._write_xlsx(path)
             reply = QMessageBox.question(
                 self, "Exported",
                 f"Report saved to:\n{path}\n\nOpen the file now?",
@@ -793,48 +807,100 @@ class CSVComparator(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Export failed", str(e))
 
-    def _apply_excel_colors(self, writer, sheet: str, df: pd.DataFrame):
+    def _write_xlsx(self, path: str):
+        """Write Summary + Comparison to xlsx in a single pass.
+
+        Uses openpyxl ws.append() directly (much faster than pd.to_excel) and
+        applies all colours — row background AND amber differing-cell highlight —
+        as direct cell fills so they are always retained, with no conditional-
+        formatting rules that would override the amber.
+        """
+        from openpyxl import Workbook
         from openpyxl.styles import PatternFill, Font
-        from openpyxl.formatting.rule import FormulaRule
         from openpyxl.utils import get_column_letter
 
-        ws = writer.sheets[sheet]
-        cols = list(df.columns)
-        status_col_letter = get_column_letter(cols.index("Status") + 1)
-        last_col_letter = get_column_letter(len(cols))
-        data_range = f"A2:{last_col_letter}{len(df) + 1}"
+        wb = Workbook()
 
-        # One CF rule per status — O(1) regardless of row count
-        for status_val, color in [
-            ("MATCH",          "E8F5E9"),
-            ("DIFFERENT",      "FFF59D"),
-            ("ONLY IN FILE 1", "FFCDD2"),
-            ("ONLY IN FILE 2", "BBDEFB"),
-        ]:
-            ws.conditional_formatting.add(
-                data_range,
-                FormulaRule(
-                    formula=[f'${status_col_letter}2="{status_val}"'],
-                    fill=PatternFill(fill_type="solid", fgColor=color),
-                ),
-            )
+        # ── Summary sheet ──────────────────────────────────────────────────────
+        ws_sum = wb.active
+        ws_sum.title = "Summary"
+        if self.summary_df is not None:
+            ws_sum.append(list(self.summary_df.columns))
+            for cell in ws_sum[1]:
+                cell.font = Font(bold=True)
+            for row in self.summary_df.itertuples(index=False):
+                ws_sum.append(list(row))
+            for i in range(1, len(self.summary_df.columns) + 1):
+                ws_sum.column_dimensions[get_column_letter(i)].width = 35
 
-        # Amber bold highlighting — only on DIFFERENT rows (small minority)
-        if "Differing Columns" not in cols:
+        # ── Comparison sheet ───────────────────────────────────────────────────
+        df = self.comparison_df
+        ws = wb.create_sheet("Comparison")
+
+        if df is None or df.empty:
+            wb.save(path)
             return
-        diff_fill = PatternFill("solid", fgColor="FFB300")
-        bold = Font(bold=True)
-        col_index = {name: i + 1 for i, name in enumerate(cols)}
 
-        for row_idx in df.index[df["Status"] == "DIFFERENT"]:
-            r = row_idx + 2  # +1 for 1-based, +1 for header
-            for col_name in [s.strip() for s in str(df.at[row_idx, "Differing Columns"]).split(",") if s.strip()]:
-                for suffix in ("(File1)", "(File2)"):
-                    target = f"{col_name} {suffix}"
-                    if target in col_index:
-                        cell = ws.cell(row=r, column=col_index[target])
-                        cell.fill = diff_fill
-                        cell.font = bold
+        cols       = list(df.columns)
+        n_cols     = len(cols)
+        status_idx = cols.index("Status") if "Status" in cols else -1
+        diff_idx   = cols.index("Differing Columns") if "Differing Columns" in cols else -1
+        col_by_name = {name: i for i, name in enumerate(cols)}
+
+        # Pre-compute amber positions: {0-based row → set of 0-based col indices}
+        amber: dict = {}
+        if diff_idx >= 0 and status_idx >= 0:
+            for r, row_t in enumerate(df.itertuples(index=False)):
+                if row_t[status_idx] == "DIFFERENT":
+                    diff_text = str(row_t[diff_idx])
+                    if diff_text:
+                        s: set = set()
+                        for col_name in (x.strip() for x in diff_text.split(",") if x.strip()):
+                            for suffix in (" (File1)", " (File2)"):
+                                t = col_name + suffix
+                                if t in col_by_name:
+                                    s.add(col_by_name[t])
+                        if s:
+                            amber[r] = s
+
+        # Reuse fill/font objects — one instance per style, shared across all cells
+        ROW_FILLS = {
+            "MATCH":          PatternFill("solid", fgColor="E8F5E9"),
+            "DIFFERENT":      PatternFill("solid", fgColor="FFF59D"),
+            "ONLY IN FILE 1": PatternFill("solid", fgColor="FFCDD2"),
+            "ONLY IN FILE 2": PatternFill("solid", fgColor="BBDEFB"),
+        }
+        AMBER_FILL = PatternFill("solid", fgColor="FFB300")
+        BOLD       = Font(bold=True)
+
+        # Header row
+        ws.append(cols)
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+
+        # Data rows — write values and apply colours in one pass
+        for r, row_t in enumerate(df.itertuples(index=False)):
+            ws.append(list(row_t))
+            excel_row  = r + 2          # 1-based index + header row
+            row_fill   = ROW_FILLS.get(row_t[status_idx]) if status_idx >= 0 else None
+            amber_cols = amber.get(r)
+
+            if row_fill is None and not amber_cols:
+                continue
+
+            for c in range(n_cols):
+                cell = ws.cell(excel_row, c + 1)
+                if amber_cols and c in amber_cols:
+                    cell.fill = AMBER_FILL
+                    cell.font = BOLD
+                elif row_fill is not None:
+                    cell.fill = row_fill
+
+        ws.freeze_panes = "A2"
+        for c_idx, col_name in enumerate(cols, 1):
+            ws.column_dimensions[get_column_letter(c_idx)].width = min(len(col_name) + 4, 40)
+
+        wb.save(path)
 
     # -- Reset --------------------------------------------------------------
     def _reset_all(self):
