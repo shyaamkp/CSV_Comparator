@@ -611,23 +611,25 @@ class CSVComparator(QMainWindow):
         all_common = [c for c in df1.columns if c in f2_cols]
         compare_cols = [c for c in self._columns_to_compare(all_common) if c not in set(keys)]
 
-        if df1.duplicated(subset=keys).any() or df2.duplicated(subset=keys).any():
-            QMessageBox.warning(
-                self,
-                "Duplicate keys",
-                "Duplicate key values detected — only the first occurrence in each file is compared.",
-            )
-            df1 = df1.drop_duplicates(subset=keys, keep="first")
-            df2 = df2.drop_duplicates(subset=keys, keep="first")
+        dup1 = int(df1.duplicated(subset=keys).sum())
+        dup2 = int(df2.duplicated(subset=keys).sum())
+
+        # Positional occurrence index within each key group so duplicate rows
+        # are matched 1st-to-1st, 2nd-to-2nd, etc. rather than being dropped.
+        df1["_occ"] = df1.groupby(keys).cumcount()
+        df2["_occ"] = df2.groupby(keys).cumcount()
+        merge_keys = keys + ["_occ"]
 
         merged = pd.merge(
-            df1[keys + compare_cols],
-            df2[keys + compare_cols],
-            on=keys,
+            df1[merge_keys + compare_cols],
+            df2[merge_keys + compare_cols],
+            on=merge_keys,
             how="outer",
             suffixes=(" (File1)", " (File2)"),
             indicator=True,
-        ).fillna("")
+        ).drop(columns=["_occ"])
+        non_cat = [c for c in merged.columns if str(merged[c].dtype) != "category"]
+        merged[non_cat] = merged[non_cat].fillna("")
 
         both = merged["_merge"] == "both"
 
@@ -663,10 +665,11 @@ class CSVComparator(QMainWindow):
             int((status == "MATCH").sum()), int((status == "DIFFERENT").sum()),
             int((status == "ONLY IN FILE 1").sum()), int((status == "ONLY IN FILE 2").sum()),
             len(self.df1), len(self.df2), compare_cols, keys_display,
+            dup1=dup1, dup2=dup2,
         )
         return comp_df, summary
 
-    def _build_summary(self, match, diff, only1, only2, n1, n2, compared_cols, keys=None):
+    def _build_summary(self, match, diff, only1, only2, n1, n2, compared_cols, keys=None, dup1=0, dup2=0):
         data = [
             ("File 1", os.path.basename(self.file1_path or "")),
             ("File 2", os.path.basename(self.file2_path or "")),
@@ -681,6 +684,9 @@ class CSVComparator(QMainWindow):
             ("Only in File 1", f"{only1:,}"),
             ("Only in File 2", f"{only2:,}"),
         ]
+        if dup1 > 0 or dup2 > 0:
+            data.append(("Duplicate Keys in File 1", f"{dup1:,} (first occurrence used)"))
+            data.append(("Duplicate Keys in File 2", f"{dup2:,} (first occurrence used)"))
         return pd.DataFrame(data, columns=["Metric", "Value"])
 
     # -- Rendering ----------------------------------------------------------
