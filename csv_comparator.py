@@ -808,22 +808,101 @@ class CSVComparator(QMainWindow):
             QMessageBox.critical(self, "Export failed", str(e))
 
     def _write_xlsx(self, path: str):
-        """Write Summary + Comparison to xlsx.
+        """Dispatch to xlsxwriter (fast) or openpyxl (fallback).
 
-        All colours are applied as Conditional Formatting rules so no per-cell
-        style objects are created or serialised — wb.save() stays fast even for
-        65 k+ rows.  Amber "differing cell" rules are registered with lower
-        priority numbers (= higher Excel precedence) than the row-colour rules
-        so amber always wins for differing cells.
+        Both paths use direct cell fills so all colours are always retained
+        regardless of Excel version or viewer settings.
         """
+        try:
+            import xlsxwriter as _xw
+            self._write_xlsx_xw(path, _xw)
+        except ImportError:
+            self._write_xlsx_openpyxl(path)
+
+    # --- helpers shared by both writers -----------------------------------
+    def _build_amber_map(self, df, col_by_name, status_idx, diff_idx):
+        """Return {0-based row → set of 0-based col indices} for amber cells."""
+        amber: dict = {}
+        if diff_idx < 0 or status_idx < 0:
+            return amber
+        for r, row_t in enumerate(df.itertuples(index=False)):
+            if row_t[status_idx] != "DIFFERENT":
+                continue
+            diff_text = str(row_t[diff_idx])
+            if not diff_text:
+                continue
+            s: set = set()
+            for col_name in (x.strip() for x in diff_text.split(",") if x.strip()):
+                for suffix in (" (File1)", " (File2)"):
+                    t = col_name + suffix
+                    if t in col_by_name:
+                        s.add(col_by_name[t])
+            if s:
+                amber[r] = s
+        return amber
+
+    def _write_xlsx_xw(self, path: str, xw):
+        """xlsxwriter path — streaming writes, ~5× faster than openpyxl."""
+        df  = self.comparison_df
+        wb  = xw.Workbook(path, {"strings_to_numbers": False,
+                                  "strings_to_urls":  False})
+
+        hdr_fmt   = wb.add_format({"bold": True})
+        blank_fmt = wb.add_format({})
+        row_fmts  = {
+            "MATCH":          wb.add_format({"bg_color": "#E8F5E9"}),
+            "DIFFERENT":      wb.add_format({"bg_color": "#FFF59D"}),
+            "ONLY IN FILE 1": wb.add_format({"bg_color": "#FFCDD2"}),
+            "ONLY IN FILE 2": wb.add_format({"bg_color": "#BBDEFB"}),
+        }
+        amber_fmt = wb.add_format({"bg_color": "#FFB300", "bold": True})
+
+        # ── Summary ────────────────────────────────────────────────────────
+        ws_sum = wb.add_worksheet("Summary")
+        if self.summary_df is not None:
+            ws_sum.write_row(0, 0, list(self.summary_df.columns), hdr_fmt)
+            for r, row_t in enumerate(self.summary_df.itertuples(index=False), 1):
+                ws_sum.write_row(r, 0, list(row_t))
+            for i in range(len(self.summary_df.columns)):
+                ws_sum.set_column(i, i, 35)
+
+        # ── Comparison ─────────────────────────────────────────────────────
+        ws = wb.add_worksheet("Comparison")
+        if df is None or df.empty:
+            wb.close()
+            return
+
+        cols        = list(df.columns)
+        col_by_name = {name: i for i, name in enumerate(cols)}
+        status_idx  = col_by_name.get("Status", -1)
+        diff_idx    = col_by_name.get("Differing Columns", -1)
+        amber       = self._build_amber_map(df, col_by_name, status_idx, diff_idx)
+
+        ws.write_row(0, 0, cols, hdr_fmt)
+        ws.freeze_panes(1, 0)
+        for c_idx, col_name in enumerate(cols):
+            ws.set_column(c_idx, c_idx, min(len(col_name) + 4, 40))
+
+        for r, row_t in enumerate(df.itertuples(index=False)):
+            row_data  = list(row_t)
+            row_fmt   = row_fmts.get(row_t[status_idx], blank_fmt) if status_idx >= 0 else blank_fmt
+            amber_set = amber.get(r)
+            ws.write_row(r + 1, 0, row_data, row_fmt)
+            if amber_set:
+                for c in amber_set:
+                    ws.write(r + 1, c, row_data[c], amber_fmt)
+
+        wb.close()
+
+    def _write_xlsx_openpyxl(self, path: str):
+        """openpyxl fallback — direct cell fills, correct on all viewers."""
         from openpyxl import Workbook
         from openpyxl.styles import PatternFill, Font
-        from openpyxl.formatting.rule import FormulaRule
         from openpyxl.utils import get_column_letter
 
         wb = Workbook()
 
-        # ── Summary sheet ──────────────────────────────────────────────────────
+        # ── Summary ────────────────────────────────────────────────────────
         ws_sum = wb.active
         ws_sum.title = "Summary"
         if self.summary_df is not None:
@@ -835,7 +914,7 @@ class CSVComparator(QMainWindow):
             for i in range(1, len(self.summary_df.columns) + 1):
                 ws_sum.column_dimensions[get_column_letter(i)].width = 35
 
-        # ── Comparison sheet ───────────────────────────────────────────────────
+        # ── Comparison ─────────────────────────────────────────────────────
         df = self.comparison_df
         ws = wb.create_sheet("Comparison")
 
@@ -845,91 +924,42 @@ class CSVComparator(QMainWindow):
 
         cols        = list(df.columns)
         n_cols      = len(cols)
-        n_rows      = len(df)
         col_by_name = {name: i for i, name in enumerate(cols)}
         status_idx  = col_by_name.get("Status", -1)
         diff_idx    = col_by_name.get("Differing Columns", -1)
+        amber       = self._build_amber_map(df, col_by_name, status_idx, diff_idx)
 
-        # Stream header + all data rows — no per-cell styling; CF handles colours
+        ROW_FILLS = {
+            "MATCH":          PatternFill("solid", fgColor="E8F5E9"),
+            "DIFFERENT":      PatternFill("solid", fgColor="FFF59D"),
+            "ONLY IN FILE 1": PatternFill("solid", fgColor="FFCDD2"),
+            "ONLY IN FILE 2": PatternFill("solid", fgColor="BBDEFB"),
+        }
+        AMBER_FILL = PatternFill("solid", fgColor="FFB300")
+        BOLD       = Font(bold=True)
+
         ws.append(cols)
         for cell in ws[1]:
             cell.font = Font(bold=True)
-        for row_t in df.itertuples(index=False):
+
+        for r, row_t in enumerate(df.itertuples(index=False)):
             ws.append(list(row_t))
+            excel_row  = r + 2
+            row_fill   = ROW_FILLS.get(row_t[status_idx]) if status_idx >= 0 else None
+            amber_cols = amber.get(r)
+            if row_fill is None and not amber_cols:
+                continue
+            for c in range(n_cols):
+                cell = ws.cell(excel_row, c + 1)
+                if amber_cols and c in amber_cols:
+                    cell.fill = AMBER_FILL
+                    cell.font = BOLD
+                elif row_fill is not None:
+                    cell.fill = row_fill
 
         ws.freeze_panes = "A2"
         for c_idx, col_name in enumerate(cols, 1):
             ws.column_dimensions[get_column_letter(c_idx)].width = min(len(col_name) + 4, 40)
-
-        if status_idx < 0 or n_rows == 0:
-            wb.save(path)
-            return
-
-        status_col = get_column_letter(status_idx + 1)
-        last_row   = n_rows + 1                          # 1-based last data row
-        data_range = f"A2:{get_column_letter(n_cols)}{last_row}"
-        prio       = 1   # CF priority counter — lower number = higher Excel precedence
-
-        # ── Amber CF rules (added first → highest precedence) ──────────────────
-        # One rule per (File1)/(File2) column pair.  The formula does an
-        # exact-word match against the ", "-separated "Differing Columns" string
-        # without SUBSTITUTE so column names containing ", " are handled safely.
-        if diff_idx >= 0:
-            diff_col   = get_column_letter(diff_idx + 1)
-            amber_fill = PatternFill("solid", fgColor="FFB300")
-            amber_font = Font(bold=True)
-            seen: set  = set()
-
-            for col in cols:
-                for suf in (" (File1)", " (File2)"):
-                    if not col.endswith(suf):
-                        continue
-                    base = col[: -len(suf)]
-                    if base in seen:
-                        break
-                    seen.add(base)
-
-                    safe = base.replace('"', '""')   # escape " for Excel string literals
-                    n    = len(base)
-                    # Exact match: base equals the whole string, or is the first
-                    # item (followed by ", "), last item (preceded by ", "), or a
-                    # middle item (surrounded by ", " on both sides).
-                    formula = (
-                        f'AND(${status_col}2="DIFFERENT",'
-                        f'OR(${diff_col}2="{safe}",'
-                        f'LEFT(${diff_col}2,{n + 2})="{safe}, ",'
-                        f'RIGHT(${diff_col}2,{n + 2})=", {safe}",'
-                        f'ISNUMBER(FIND(", {safe}, ",${diff_col}2))))'
-                    )
-                    for target_suf in (" (File1)", " (File2)"):
-                        target = base + target_suf
-                        if target not in col_by_name:
-                            continue
-                        c_let = get_column_letter(col_by_name[target] + 1)
-                        rule  = FormulaRule(
-                            formula=[formula], fill=amber_fill, font=amber_font
-                        )
-                        rule.priority = prio
-                        prio += 1
-                        ws.conditional_formatting.add(
-                            f"{c_let}2:{c_let}{last_row}", rule
-                        )
-                    break   # base processed; skip the other suffix for this col
-
-        # ── Row-colour CF rules (added last → lower precedence than amber) ──────
-        for status_val, color in [
-            ("MATCH",          "E8F5E9"),
-            ("DIFFERENT",      "FFF59D"),
-            ("ONLY IN FILE 1", "FFCDD2"),
-            ("ONLY IN FILE 2", "BBDEFB"),
-        ]:
-            rule = FormulaRule(
-                formula=[f'${status_col}2="{status_val}"'],
-                fill=PatternFill("solid", fgColor=color),
-            )
-            rule.priority = prio
-            prio += 1
-            ws.conditional_formatting.add(data_range, rule)
 
         wb.save(path)
 
